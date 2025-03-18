@@ -97,10 +97,7 @@ function GameUI() {
 ### 3. Server-Side Integration (Cloudflare Workers)
 
 ```typescript
-// wrangler.toml
-// [See Cloudflare Workers setup below]
-
-// src/worker.ts
+// worker.ts
 import { createCastRouter } from '@open-game-collective/cast-kit/server';
 import { createKVStorageHooks } from '@open-game-collective/cast-kit/server/storage';
 
@@ -110,28 +107,34 @@ export interface Env {
   CAST_SESSION_WORKFLOW: any;
 }
 
-export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
-    const url = new URL(request.url);
-    
+// Use the class pattern for better performance with singleton router
+export default class Worker {
+  // Create the cast router once when the worker is instantiated
+  private castRouter: ReturnType<typeof createCastRouter>;
+  
+  constructor(env: Env) {
     // Create storage hooks using Cloudflare KV
     const storageHooks = createKVStorageHooks(env.CAST_SESSIONS);
     
-    // Create the cast router
-    const castRouter = createCastRouter({
-      renderHost: env.RENDER_HOST,  // Renderer service host
+    // Create the cast router once 
+    this.castRouter = createCastRouter({
+      renderHost: env.RENDER_HOST,
       storageHooks,
-      workflowBinding: env.CAST_SESSION_WORKFLOW  // Workflow binding
+      workflowBinding: env.CAST_SESSION_WORKFLOW
     });
+  }
+  
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
     
     // Handle cast routes
     if (url.pathname.startsWith('/api/cast/')) {
-      return castRouter(request);
+      return this.castRouter(request);
     }
     
     return new Response('Not Found', { status: 404 });
   }
-};
+}
 ```
 
 ## Detailed Setup Guide
@@ -248,7 +251,7 @@ function GameUI() {
 
 ### Server-Side Setup (Cloudflare Workers)
 
-The server-side component requires Cloudflare Workers with Workflows enabled.
+The server-side component requires Cloudflare Workers with Workflows enabled. For optimal performance, initialize the router once when the worker is instantiated.
 
 #### 1. Configure wrangler.toml
 
@@ -272,7 +275,7 @@ name = "cast-session-workflow"
 binding = "CAST_SESSION_WORKFLOW"
 ```
 
-#### 2. Implement the Worker
+#### 2. Implement the Worker Using the Singleton Pattern
 
 ```typescript
 // src/worker.ts
@@ -280,28 +283,123 @@ import { createCastRouter } from '@open-game-collective/cast-kit/server';
 import { createKVStorageHooks } from '@open-game-collective/cast-kit/server/storage';
 import { CastSessionWorkflow } from '@open-game-collective/cast-kit/server/workflows';
 
+// Define proper typing for the Workflow binding
+interface WorkflowBinding<T> {
+  create: (payload: T) => Promise<WorkflowInstance>;
+  get: (id: string) => Promise<WorkflowInstance | null>;
+}
+
+interface WorkflowInstance {
+  id: string;
+  status: () => Promise<string>;
+  terminate: () => Promise<void>;
+}
+
+interface CastSessionParams {
+  sessionId: string;
+  gameUrl: string;
+  options?: Record<string, any>;
+}
+
 export interface Env {
   CAST_SESSIONS: KVNamespace;
   RENDER_HOST: string;
-  CAST_SESSION_WORKFLOW: any;
+  CAST_SESSION_WORKFLOW: WorkflowBinding<CastSessionParams>;
 }
 
 // Export the workflow class for Cloudflare Workflows
 export { CastSessionWorkflow };
 
-export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
-    const url = new URL(request.url);
-    
+// Use the WorkerEntrypoint pattern for better performance
+export default class Worker {
+  // Create the cast router once when the worker is instantiated
+  private castRouter: ReturnType<typeof createCastRouter>;
+  
+  constructor(env: Env) {
     // Create storage hooks using Cloudflare KV
     const storageHooks = createKVStorageHooks(env.CAST_SESSIONS);
     
-    // Create the cast router
-    const castRouter = createCastRouter({
+    // Create the cast router once 
+    this.castRouter = createCastRouter({
       renderHost: env.RENDER_HOST,
       storageHooks,
       workflowBinding: env.CAST_SESSION_WORKFLOW
     });
+  }
+  
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+    
+    // Handle cast routes
+    if (url.pathname.startsWith('/api/cast/')) {
+      return this.castRouter(request);
+    }
+    
+    // Handle other routes
+    // For example, integrate with other systems like actor-kit if needed
+    
+    return new Response('Not Found', { status: 404 });
+  }
+}
+```
+
+#### 3. Alternative Implementation Using a Module-level Singleton
+
+If you prefer a simpler approach without classes:
+
+```typescript
+// src/worker.ts
+import { createCastRouter } from '@open-game-collective/cast-kit/server';
+import { createKVStorageHooks } from '@open-game-collective/cast-kit/server/storage';
+import { CastSessionWorkflow } from '@open-game-collective/cast-kit/server/workflows';
+
+// Define proper typing for the Workflow binding
+interface WorkflowBinding<T> {
+  create: (payload: T) => Promise<WorkflowInstance>;
+  get: (id: string) => Promise<WorkflowInstance | null>;
+}
+
+interface WorkflowInstance {
+  id: string;
+  status: () => Promise<string>;
+  terminate: () => Promise<void>;
+}
+
+interface CastSessionParams {
+  sessionId: string;
+  gameUrl: string;
+  options?: Record<string, any>;
+}
+
+export interface Env {
+  CAST_SESSIONS: KVNamespace;
+  RENDER_HOST: string;
+  CAST_SESSION_WORKFLOW: WorkflowBinding<CastSessionParams>;
+}
+
+// Export the workflow class for Cloudflare Workflows
+export { CastSessionWorkflow };
+
+// Module-level variables for singleton pattern
+let castRouter: ReturnType<typeof createCastRouter>;
+let initializingEnv: Env | null = null;
+
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    // Lazy initialization of the router singleton
+    if (!castRouter || initializingEnv !== env) {
+      const storageHooks = createKVStorageHooks(env.CAST_SESSIONS);
+      
+      castRouter = createCastRouter({
+        renderHost: env.RENDER_HOST,
+        storageHooks,
+        workflowBinding: env.CAST_SESSION_WORKFLOW
+      });
+      
+      initializingEnv = env;
+    }
+    
+    const url = new URL(request.url);
     
     // Handle cast routes
     if (url.pathname.startsWith('/api/cast/')) {
@@ -313,11 +411,14 @@ export default {
 };
 ```
 
-#### 3. Deploy to Cloudflare
+#### Performance Benefits
 
-```bash
-npx wrangler publish
-```
+Using the singleton pattern to initialize the router once offers several advantages:
+
+1. **Reduced Overhead**: Avoids recreating the router and its dependencies on every request
+2. **Faster Response Times**: Eliminates initialization time from request handling
+3. **Resource Efficiency**: Creates storage hooks and other resources only once
+4. **Better Integration**: Easier to integrate with other routers and services
 
 ### Broadcast Page
 
