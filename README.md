@@ -79,7 +79,7 @@ import { CastButton } from '@open-game-collective/cast-kit/react';
 
 // Create a client
 const castClient = createCastClient({
-  host: 'your-game-domain.com', // Your game's domain
+  host: 'triviajam.tv', // Domain where your Cast Router service is running
 });
 
 // In your React component
@@ -249,6 +249,146 @@ function GameUI() {
 }
 ```
 
+#### Integration with Auth Kit
+
+You can integrate Cast Kit with Auth Kit to ensure that authenticated sessions are maintained when broadcasting:
+
+```jsx
+import { 
+  createCastKitContext, 
+  CastButton 
+} from '@open-game-collective/cast-kit/react';
+import { createCastClient } from '@open-game-collective/cast-kit/client';
+import { AuthContext } from '@open-game-collective/auth-kit/react';
+
+// Create the cast context
+export const CastKitContext = createCastKitContext();
+
+// In your game component
+function GameUI() {
+  // Get auth client
+  const authClient = AuthContext.useClient();
+  
+  // Get cast client
+  const castClient = CastKitContext.useClient();
+  
+  // Get auth state
+  const { isAuthenticated, userId } = AuthContext.useSelector(state => ({
+    isAuthenticated: !!state.userId,
+    userId: state.userId
+  }));
+  
+  // Function to handle casting with auth
+  const handleCast = async () => {
+    try {
+      // If authenticated, get a web auth code
+      if (isAuthenticated) {
+        // Get web auth code from Auth Kit
+        const { code } = await authClient.getWebAuthCode();
+        
+        // Create URL with auth code for the cast page
+        const castUrl = new URL('https://triviajam.tv/cast');
+        castUrl.searchParams.append('gameId', '123');
+        castUrl.searchParams.append('roomCode', 'ABCD');
+        castUrl.searchParams.append('code', code); // Add auth code to URL
+        
+        // Start broadcasting with authenticated session
+        await castClient.createBroadcastSession({
+          gameUrl: castUrl.toString()
+        });
+      } else {
+        // Handle unauthenticated case
+        const castUrl = new URL('https://triviajam.tv/cast');
+        castUrl.searchParams.append('gameId', '123');
+        castUrl.searchParams.append('roomCode', 'ABCD');
+        
+        await castClient.createBroadcastSession({
+          gameUrl: castUrl.toString()
+        });
+      }
+    } catch (error) {
+      console.error('Error starting cast:', error);
+    }
+  };
+  
+  return (
+    <div>
+      <h1>Your Game</h1>
+      <CastButton onCast={handleCast} />
+      {isAuthenticated && <p>Casting as user: {userId}</p>}
+    </div>
+  );
+}
+
+// In your App component
+function App() {
+  // Initialize clients
+  const castClient = createCastClient({
+    host: 'triviajam.tv'
+  });
+  
+  return (
+    <AuthContext.Provider client={authClient}>
+      <CastKitContext.Provider client={castClient}>
+        <GameUI />
+      </CastKitContext.Provider>
+    </AuthContext.Provider>
+  );
+}
+```
+
+On your cast page, you'll need to handle the auth code:
+
+```jsx
+// pages/cast.tsx
+import { useEffect, useState } from 'react';
+import { useGameState } from '../hooks/useGameState';
+
+export default function CastPage() {
+  const [params, setParams] = useState(null);
+  
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    const urlParams = new URLSearchParams(url.search);
+    
+    // Extract params including auth code
+    setParams({
+      gameId: urlParams.get('gameId'),
+      roomCode: urlParams.get('roomCode'),
+      authCode: urlParams.get('code') // Get auth code from URL
+    });
+    
+    // If we have an auth code, Auth Kit middleware will automatically 
+    // handle the authentication by setting the appropriate cookies
+    // This happens server-side in your Cloudflare Worker
+  }, []);
+  
+  // Connect to game state if we have params
+  const { gameState, loading, error } = useGameState(
+    params?.gameId, 
+    params?.roomCode
+  );
+  
+  if (!params) return <div>Loading...</div>;
+  if (loading) return <div>Connecting to game...</div>;
+  if (error) return <div>Error connecting to game: {error.message}</div>;
+  
+  return (
+    <div className="tv-display">
+      {/* Game display optimized for TV */}
+      <GameDisplay gameState={gameState} isTvMode={true} />
+    </div>
+  );
+}
+```
+
+This approach ensures that:
+
+1. When a user initiates casting, their authentication status is preserved
+2. The Chromecast receiver gets an authenticated session via the web auth code
+3. The auth state is properly handled on the server side through Auth Kit's middleware
+4. The Cast Router maintains session information to keep the connection alive
+
 ### Server-Side Setup (Cloudflare Workers)
 
 The server-side component requires Cloudflare Workers with Workflows enabled. For optimal performance, initialize the router once when the worker is instantiated.
@@ -260,7 +400,7 @@ name = "your-game-cast-router"
 main = "src/worker.ts"
 compatibility_date = "2023-12-01"
 
-# KV Namespace for storing session data
+# KV Namespace for storing session data (optional - you can use any storage solution)
 [[kv_namespaces]]
 binding = "CAST_SESSIONS"
 id = "your-kv-namespace-id"  # Create this in the Cloudflare dashboard
@@ -316,13 +456,13 @@ export default class Worker {
   private castRouter: ReturnType<typeof createCastRouter>;
   
   constructor(env: Env) {
-    // Create storage hooks using Cloudflare KV
+    // Create storage hooks using Cloudflare KV (this is just one storage option)
     const storageHooks = createKVStorageHooks(env.CAST_SESSIONS);
     
     // Create the cast router once 
     this.castRouter = createCastRouter({
       renderHost: env.RENDER_HOST,
-      storageHooks,
+      storageHooks, // You can use any storage implementation here
       workflowBinding: env.CAST_SESSION_WORKFLOW
     });
   }
@@ -341,74 +481,6 @@ export default class Worker {
     return new Response('Not Found', { status: 404 });
   }
 }
-```
-
-#### 3. Alternative Implementation Using a Module-level Singleton
-
-If you prefer a simpler approach without classes:
-
-```typescript
-// src/worker.ts
-import { createCastRouter } from '@open-game-collective/cast-kit/server';
-import { createKVStorageHooks } from '@open-game-collective/cast-kit/server/storage';
-import { CastSessionWorkflow } from '@open-game-collective/cast-kit/server/workflows';
-
-// Define proper typing for the Workflow binding
-interface WorkflowBinding<T> {
-  create: (payload: T) => Promise<WorkflowInstance>;
-  get: (id: string) => Promise<WorkflowInstance | null>;
-}
-
-interface WorkflowInstance {
-  id: string;
-  status: () => Promise<string>;
-  terminate: () => Promise<void>;
-}
-
-interface CastSessionParams {
-  sessionId: string;
-  gameUrl: string;
-  options?: Record<string, any>;
-}
-
-export interface Env {
-  CAST_SESSIONS: KVNamespace;
-  RENDER_HOST: string;
-  CAST_SESSION_WORKFLOW: WorkflowBinding<CastSessionParams>;
-}
-
-// Export the workflow class for Cloudflare Workflows
-export { CastSessionWorkflow };
-
-// Module-level variables for singleton pattern
-let castRouter: ReturnType<typeof createCastRouter>;
-let initializingEnv: Env | null = null;
-
-export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
-    // Lazy initialization of the router singleton
-    if (!castRouter || initializingEnv !== env) {
-      const storageHooks = createKVStorageHooks(env.CAST_SESSIONS);
-      
-      castRouter = createCastRouter({
-        renderHost: env.RENDER_HOST,
-        storageHooks,
-        workflowBinding: env.CAST_SESSION_WORKFLOW
-      });
-      
-      initializingEnv = env;
-    }
-    
-    const url = new URL(request.url);
-    
-    // Handle cast routes
-    if (url.pathname.startsWith('/api/cast/')) {
-      return castRouter(request);
-    }
-    
-    return new Response('Not Found', { status: 404 });
-  }
-};
 ```
 
 #### Performance Benefits
@@ -535,12 +607,12 @@ function createKVStorageHooks(namespace: KVNamespace): StorageHooks;
 
 ### Custom Storage
 
-Cast Kit uses Cloudflare KV by default, but you can implement custom storage:
+Cast Kit is completely unopinionated about storage solutions. You need to provide a storage implementation that matches the `StorageHooks` interface:
 
 ```typescript
 import { StorageHooks } from '@open-game-collective/cast-kit/server';
 
-// Custom storage implementation
+// Implement your own storage solution
 const customStorage: StorageHooks = {
   saveSession: async (session) => {
     // Save session to your storage
@@ -563,13 +635,33 @@ const customStorage: StorageHooks = {
   }
 };
 
-// Use custom storage with the router
+// Use your custom storage with the router
 const castRouter = createCastRouter({
   renderHost: env.RENDER_HOST,
-  storageHooks: customStorage,
+  storageHooks: customStorage, // Your custom implementation
   workflowBinding: env.CAST_SESSION_WORKFLOW
 });
 ```
+
+We provide a KV implementation for convenience, but you can use any storage solution:
+
+```typescript
+// Using the KV implementation
+import { createKVStorageHooks } from '@open-game-collective/cast-kit/server/storage';
+
+// Create storage hooks using Cloudflare KV
+const kvStorage = createKVStorageHooks(env.CAST_SESSIONS);
+
+// Using Durable Objects (example - implementation not included in Cast Kit)
+const durableObjectStorage = createDurableObjectStorageHooks(env.CAST_SESSION_DO);
+
+// Using a database (example - implementation not included in Cast Kit)
+const dbStorage = createDatabaseStorageHooks({
+  connectionString: env.DATABASE_URL
+});
+```
+
+You can choose the storage solution that best fits your needs and infrastructure.
 
 ### Debugging
 
